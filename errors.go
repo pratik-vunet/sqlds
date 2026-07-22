@@ -4,7 +4,6 @@ import (
 	"errors"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
-	es "github.com/grafana/grafana-plugin-sdk-go/experimental/errorsource"
 )
 
 var (
@@ -18,20 +17,15 @@ var (
 	ErrorTimeout = errors.New("query timeout exceeded")
 	// ErrorNoResults is returned if there were no results returned
 	ErrorNoResults = errors.New("no results returned from query")
+	// ErrorRowValidation is returned when SQL rows validation fails (e.g., connection issues, corrupt results)
+	ErrorRowValidation = errors.New("SQL rows validation failed")
+	// ErrorConnectionClosed is returned when the database connection is unexpectedly closed
+	ErrorConnectionClosed = errors.New("database connection closed")
 )
 
-func PluginError(err error, override ...bool) error {
-	return es.PluginError(err, len(override) > 0)
-}
-
-func DownstreamError(err error, override ...bool) error {
-	return es.DownstreamError(err, len(override) > 0)
-}
-
 func ErrorSource(err error) backend.ErrorSource {
-	var se es.Error
-	if errors.As(err, &se) {
-		return se.Source()
+	if backend.IsDownstreamError(err) {
+		return backend.ErrorSourceDownstream
 	}
 	return backend.ErrorSourcePlugin
 }

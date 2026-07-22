@@ -10,16 +10,32 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
+
+	"github.com/grafana/sqlds/v5/responseobs"
 )
 
 type DriverSettings struct {
-	Timeout        time.Duration
 	FillMode       *data.FillMissing
+	RetryOn        []string
+	Timeout        time.Duration
 	Retries        int
 	Pause          int
-	RetryOn        []string
 	ForwardHeaders bool
 	Errors         bool
+	RowLimit       int64
+	// RowCapacityHint is an optional expected row count, used to presize
+	// data.Frame fields before scanning rows. Set to 0 (the default) to
+	// preserve the historical behavior of growing Fields as rows arrive.
+	// Drivers that can estimate a floor (paginated queries, COUNT-first
+	// patterns, statements with a hard LIMIT) should set this to avoid
+	// per-column slice growth during FrameFromRows.
+	RowCapacityHint int64
+	// ResponseThresholds configures when a query response is considered
+	// "large" enough to emit a structured warn log. A zero value on
+	// either field disables that dimension. At the sqlds layer bytes
+	// cannot be measured cheaply, so only the Rows threshold takes
+	// effect for sqlds-emitted observations.
+	ResponseThresholds responseobs.Thresholds
 }
 
 // Driver is a simple interface that defines how to connect to a backend SQL datasource
@@ -42,6 +58,19 @@ type Connection interface {
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 }
 
+// QueryDataMutator  is an additional interface that could be implemented by driver.
+// This adds ability to the driver to optionally mutate the query before it's run
+// with the QueryDataRequest.
+type QueryDataMutator interface {
+	MutateQueryData(ctx context.Context, req *backend.QueryDataRequest) (context.Context, *backend.QueryDataRequest)
+}
+
+// CheckHealthMutator  is an additional interface that could be implemented by driver.
+// This adds ability to the driver to optionally mutate the CheckHealth before it's run
+type CheckHealthMutator interface {
+	MutateCheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (context.Context, *backend.CheckHealthRequest)
+}
+
 // QueryMutator is an additional interface that could be implemented by driver.
 // This adds ability to the driver it can mutate query before run.
 type QueryMutator interface {
@@ -58,4 +87,8 @@ type QueryArgSetter interface {
 // This adds ability to the driver, so it can mutate a response from the driver before its returned to the client.
 type ResponseMutator interface {
 	MutateResponse(ctx context.Context, res data.Frames) (data.Frames, error)
+}
+
+type QueryErrorMutator interface {
+	MutateQueryError(err error) backend.ErrorWithSource
 }

@@ -12,14 +12,14 @@ import (
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
-	"github.com/grafana/sqlds/v3"
-	"github.com/grafana/sqlds/v3/mock"
+	"github.com/grafana/sqlds/v5"
+	"github.com/grafana/sqlds/v5/mock"
 )
 
 var registered = map[string]*SqlHandler{}
 
 // NewDriver creates and registers a new test datasource driver
-func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts DriverOpts) (TestDS, *SqlHandler) {
+func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts DriverOpts, macros sqlds.Macros) (TestDS, *SqlHandler) {
 	if registered[name] == nil {
 		handler := NewDriverHandler(dbdata, opts)
 		registered[name] = &handler
@@ -34,14 +34,16 @@ func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts Dr
 			return sql.Open(name, "")
 		},
 		converters,
+		macros,
 	), registered[name]
 }
 
 // NewTestDS creates a new test datasource driver
-func NewTestDS(openDBfn func(msg json.RawMessage) (*sql.DB, error), converters []sqlutil.Converter) TestDS {
+func NewTestDS(openDBfn func(msg json.RawMessage) (*sql.DB, error), converters []sqlutil.Converter, macros sqlds.Macros) TestDS {
 	return TestDS{
 		openDBfn:   openDBfn,
 		converters: converters,
+		macros:     macros,
 	}
 }
 
@@ -104,11 +106,11 @@ func (s *SqlHandler) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 
+	row := s.Data.Rows[s.row]
 	s.row++
-	for _, row := range s.Data.Rows {
-		for i, col := range row {
-			dest[i] = col
-		}
+
+	for i, col := range row {
+		dest[i] = col
 	}
 	return nil
 }
@@ -146,6 +148,7 @@ type Column struct {
 type TestDS struct {
 	openDBfn   func(msg json.RawMessage) (*sql.DB, error)
 	converters []sqlutil.Converter
+	macros     sqlds.Macros
 	sqlds.Driver
 }
 
@@ -171,7 +174,7 @@ func (s TestDS) Settings(ctx context.Context, config backend.DataSourceInstanceS
 
 // Macros - Macros for the test database
 func (s TestDS) Macros() sqlds.Macros {
-	return sqlds.DefaultMacros
+	return s.macros
 }
 
 // Converters - Converters for the test database

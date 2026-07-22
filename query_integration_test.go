@@ -4,12 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -54,7 +54,7 @@ func TestQuery_MySQL(t *testing.T) {
 	// Attempt to connect multiple times because these tests are ran in Drone, where the mysql server may not be immediately available when this test is ran.
 	limit := 10
 	for i := 0; i < limit; i++ {
-		log.Println("Attempting mysql connection...")
+		t.Log("Attempting mysql connection...")
 		d, err := sql.Open("mysql", args.MySQLURL)
 		if err == nil {
 			if err := d.Ping(); err == nil {
@@ -75,7 +75,12 @@ func TestQuery_MySQL(t *testing.T) {
 			RawSQL: "SELECT SLEEP(5)",
 		}
 
-		_, err := QueryDB(ctx, db, []sqlutil.Converter{}, nil, q)
+		settings := backend.DataSourceInstanceSettings{
+			Name: "foo",
+		}
+
+		sqlQuery := NewQuery(db, settings, []sqlutil.Converter{}, nil, defaultRowLimit)
+		_, err := sqlQuery.Run(ctx, q, nil)
 		if err == nil {
 			t.Fatal("expected an error but received none")
 		}
