@@ -3,6 +3,7 @@ package sqlds
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -10,6 +11,37 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 )
+
+// Test_storeKeyFor guards the vunet per-user connection feature: connections
+// must be keyed by "<uid>-<username>" when JSONData carries a username, so users
+// sharing a datasource with distinct credentials get isolated pooled connections.
+func Test_storeKeyFor(t *testing.T) {
+	tests := []struct {
+		desc     string
+		uid      string
+		id       int64
+		jsonData string
+		want     string
+	}{
+		{desc: "no username keys by uid", uid: "uid1", jsonData: `{}`, want: "uid1"},
+		{desc: "username is appended", uid: "uid1", jsonData: `{"username":"alice"}`, want: "uid1-alice"},
+		{desc: "different users differ", uid: "uid1", jsonData: `{"username":"bob"}`, want: "uid1-bob"},
+		{desc: "empty uid falls back to id", uid: "", id: 42, jsonData: `{}`, want: "42"},
+		{desc: "invalid json keys by uid", uid: "uid1", jsonData: `not-json`, want: "uid1"},
+		{desc: "nil json keys by uid", uid: "uid1", jsonData: ``, want: "uid1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			settings := backend.DataSourceInstanceSettings{UID: tt.uid, ID: tt.id}
+			if tt.jsonData != "" {
+				settings.JSONData = json.RawMessage(tt.jsonData)
+			}
+			if got := storeKeyFor(settings); got != tt.want {
+				t.Fatalf("storeKeyFor = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 type fakeDriver struct {
 	openDBfn func(msg json.RawMessage) (*sql.DB, error)
@@ -29,18 +61,28 @@ func (d fakeDriver) Converters() []sqlutil.Converter {
 	return []sqlutil.Converter{}
 }
 
+type fakeSQLConnector struct{}
+
+func (f fakeSQLConnector) Connect(_ context.Context) (driver.Conn, error) {
+	return nil, nil
+}
+
+func (f fakeSQLConnector) Driver() driver.Driver {
+	return nil
+}
+
 func Test_getDBConnectionFromQuery(t *testing.T) {
 	db := &sql.DB{}
 	db2 := &sql.DB{}
 	db3 := &sql.DB{}
 	d := &fakeDriver{openDBfn: func(msg json.RawMessage) (*sql.DB, error) { return db3, nil }}
 	tests := []struct {
+		existingDB  *sql.DB
+		expectedDB  *sql.DB
 		desc        string
 		dsUID       string
 		args        string
-		existingDB  *sql.DB
 		expectedKey string
-		expectedDB  *sql.DB
 	}{
 		{
 			desc:        "it should return the default db with no args",
@@ -53,7 +95,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 			desc:        "it should return the cached connection for the given args",
 			dsUID:       "uid1",
 			args:        "foo",
-			expectedKey: "uid1-foo",
+			expectedKey: "uid1-2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
 			existingDB:  db2,
 			expectedDB:  db2,
 		},
@@ -61,23 +103,23 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 			desc:        "it should create a new connection with the given args",
 			dsUID:       "uid1",
 			args:        "foo",
-			expectedKey: "uid1-foo",
+			expectedKey: "uid1-2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
 			expectedDB:  db3,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
-			ds := &SQLDatasource{c: d, EnableMultipleConnections: true}
+			conn := &Connector{UID: tt.dsUID, storeKey: tt.dsUID, defaultKey: defaultKey(tt.dsUID), driver: d, enableMultipleConnections: true, driverSettings: DriverSettings{}, cache: NewSyncMapCache()}
 			settings := backend.DataSourceInstanceSettings{UID: tt.dsUID}
 			key := defaultKey(tt.dsUID)
 			// Add the mandatory default db
-			ds.storeDBConnection(key, dbConnection{db, settings})
+			conn.storeDBConnection(key, CachedConnection{db, settings})
 			if tt.existingDB != nil {
 				key = keyWithConnectionArgs(tt.dsUID, []byte(tt.args))
-				ds.storeDBConnection(key, dbConnection{tt.existingDB, settings})
+				conn.storeDBConnection(key, CachedConnection{tt.existingDB, settings})
 			}
 
-			key, dbConn, err := ds.getDBConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage(tt.args)}, tt.dsUID)
+			key, dbConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage(tt.args)})
 			if err != nil {
 				t.Fatalf("unexpected error %v", err)
 			}
@@ -91,16 +133,16 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 	}
 
 	t.Run("it should return an error if connection args are used without enabling multiple connections", func(t *testing.T) {
-		ds := &SQLDatasource{c: d, EnableMultipleConnections: false}
-		_, _, err := ds.getDBConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")}, "dsUID")
+		conn := &Connector{driver: d, enableMultipleConnections: false, cache: NewSyncMapCache()}
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")})
 		if err == nil || !errors.Is(err, MissingMultipleConnectionsConfig) {
 			t.Errorf("expecting error: %v", MissingMultipleConnectionsConfig)
 		}
 	})
 
 	t.Run("it should return an error if the default connection is missing", func(t *testing.T) {
-		ds := &SQLDatasource{c: d}
-		_, _, err := ds.getDBConnectionFromQuery(context.Background(), &Query{}, "dsUID")
+		conn := &Connector{driver: d, cache: NewSyncMapCache()}
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{})
 		if err == nil || !errors.Is(err, MissingDBConnection) {
 			t.Errorf("expecting error: %v", MissingDBConnection)
 		}
@@ -108,18 +150,21 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 }
 
 func Test_Dispose(t *testing.T) {
-	t.Run("it should not delete connections", func(t *testing.T) {
-		ds := &SQLDatasource{}
-		ds.dbConnections.Store(defaultKey("uid1"), dbConnection{})
-		ds.dbConnections.Store("foo", dbConnection{})
+	t.Run("it should close connections", func(t *testing.T) {
+		db := sql.OpenDB(fakeSQLConnector{})
+		d := &fakeDriver{openDBfn: func(msg json.RawMessage) (*sql.DB, error) { return db, nil }}
+		conn := &Connector{driver: d, cache: NewSyncMapCache()}
+		ds := &SQLDatasource{connector: conn}
+		conn.storeDBConnection(defaultKey("uid1"), CachedConnection{db: db})
+		conn.storeDBConnection("foo", CachedConnection{db: db})
 		ds.Dispose()
 		count := 0
-		ds.dbConnections.Range(func(key, value interface{}) bool {
+		conn.cache.Range(func(key string, value CachedConnection) bool {
 			count++
 			return true
 		})
-		if count != 2 {
-			t.Errorf("missing connections")
+		if count != 0 {
+			t.Errorf("did not close all connections")
 		}
 	})
 }

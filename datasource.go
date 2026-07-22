@@ -2,139 +2,185 @@ package sqlds
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"os"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
+
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/resource/httpadapter"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 )
 
 const defaultKeySuffix = "default"
+const defaultRowLimit = int64(-1)
+const envRowLimit = "GF_DATAPROXY_ROW_LIMIT"
 
 var (
-	ErrorMissingMultipleConnectionsConfig = PluginError(
-		errors.New("received connection arguments but the feature is not enabled"),
-	)
-	ErrorMissingDBConnection = PluginError(
-		errors.New("unable to get default db connection"),
-	)
-	HeaderKey = "grafana-http-headers"
+	ErrorMissingMultipleConnectionsConfig = backend.PluginError(errors.New("received connection arguments but the feature is not enabled"))
+	ErrorMissingDBConnection              = backend.PluginError(errors.New("unable to get default db connection"))
+	HeaderKey                             = "grafana-http-headers"
 	// Deprecated: ErrorMissingMultipleConnectionsConfig should be used instead
 	MissingMultipleConnectionsConfig = ErrorMissingMultipleConnectionsConfig
 	// Deprecated: ErrorMissingDBConnection should be used instead
 	MissingDBConnection = ErrorMissingDBConnection
 )
 
-func defaultKey(connKey string) string {
-	return fmt.Sprintf("%s-%s", connKey, defaultKeySuffix)
+func defaultKey(datasourceUID string) string {
+	return fmt.Sprintf("%s-%s", datasourceUID, defaultKeySuffix)
 }
 
-func keyWithConnectionArgs(connKey string, connArgs json.RawMessage) string {
-	return fmt.Sprintf("%s-%s", connKey, string(connArgs))
+func keyWithConnectionArgs(datasourceUID string, connArgs json.RawMessage) string {
+	connectionArgsHash := sha256.Sum256(connArgs)
+	return fmt.Sprintf("%s-%x", datasourceUID, connectionArgsHash)
 }
 
-type dbConnection struct {
+// CachedConnection is the value type held by a ConnectionCache. It pairs the
+// underlying *sql.DB with the DataSourceInstanceSettings captured when the
+// connection was opened and exposes them, plus a Close lifecycle method,
+// through exported accessors. The fields stay unexported: sqlds constructs
+// every CachedConnection, and ConnectionCache implementations handle them as
+// opaque cache entries (inspecting via the accessors, closing via Close on
+// eviction).
+type CachedConnection struct {
 	db       *sql.DB
 	settings backend.DataSourceInstanceSettings
 }
 
+// DB returns the underlying *sql.DB.
+func (c CachedConnection) DB() *sql.DB { return c.db }
+
+// Settings returns the DataSourceInstanceSettings captured when the
+// connection was opened.
+func (c CachedConnection) Settings() backend.DataSourceInstanceSettings { return c.settings }
+
+// Close closes the underlying *sql.DB. It is safe to call multiple times;
+// subsequent calls return the same error database/sql would return. A zero
+// value or empty cache slot (nil db) is a no-op.
+func (c CachedConnection) Close() error {
+	if c.db == nil {
+		return nil
+	}
+	return c.db.Close()
+}
+
 type SQLDatasource struct {
 	Completable
-
-	dbConnections  sync.Map
-	c              Driver
-	driverSettings DriverSettings
-
 	backend.CallResourceHandler
-	CustomRoutes map[string]func(http.ResponseWriter, *http.Request)
-	// Enabling multiple connections may cause that concurrent connection limits
-	// are hit. The datasource enabling this should make sure connections are cached
-	// if necessary.
+	connector                 *Connector
+	CustomRoutes              map[string]func(http.ResponseWriter, *http.Request)
+	metrics                   Metrics
 	EnableMultipleConnections bool
-}
+	// EnableRowLimit: enables using the dataproxy.row_limit setting to limit the number of rows returned by the query
+	// https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/#row_limit
+	EnableRowLimit bool
+	rowLimit       int64
+	// cachedConverters is ds.driver().Converters() captured once in
+	// NewDatasource. Drivers like snowflake/bigquery/clickhouse allocate a
+	// fresh slice on each Converters() call — hot-path reads here avoid that.
+	cachedConverters []sqlutil.Converter
+	// Cached optional-mutator interface assertions against the driver.
+	// These are resolved once in NewDatasource instead of on every query.
+	queryDataMutator   QueryDataMutator
+	queryMutator       QueryMutator
+	responseMutator    ResponseMutator
+	queryArgSetter     QueryArgSetter
+	queryErrorMutator  QueryErrorMutator
+	checkHealthMutator CheckHealthMutator
+	// rowCapacityHint mirrors DriverSettings.RowCapacityHint, resolved once
+	// at init and passed into every DBQuery so FrameFromRows can presize
+	// its Fields. Zero disables presizing.
+	rowCapacityHint int64
+	// PreCheckHealth (optional). Performs custom health check before the Connect method
+	PreCheckHealth func(ctx context.Context, req *backend.CheckHealthRequest) *backend.CheckHealthResult
+	// PostCheckHealth (optional).Performs custom health check after the Connect method
+	PostCheckHealth func(ctx context.Context, req *backend.CheckHealthRequest) *backend.CheckHealthResult
+	// ResourceMiddleware (optional). Allows interception to CallResource before it is passed to sqlds
+	ResourceMiddleware func(next backend.CallResourceHandler) backend.CallResourceHandler
 
-func (ds *SQLDatasource) getDBConnection(key string) (dbConnection, bool) {
-	conn, ok := ds.dbConnections.Load(key)
-	if !ok {
-		return dbConnection{}, false
-	}
-	return conn.(dbConnection), true
-}
+	// Interpolator (optional). Produces the SQL that reaches the driver.
+	// NewDatasource installs a default that runs the driver's legacy macros;
+	// assign your own func to replace the pipeline (e.g. an AST-aware rewriter
+	// or a macropro-backed handler). A nil value resolves to the default, so a
+	// zero-value SQLDatasource built without NewDatasource still interpolates.
+	Interpolator Interpolator
 
-func (ds *SQLDatasource) storeDBConnection(key string, dbConn dbConnection) {
-	ds.dbConnections.Store(key, dbConn)
-}
-
-func (ds *SQLDatasource) getStoreKey(settings backend.DataSourceInstanceSettings) string {
-	datasourceUID := settings.UID
-	// Grafana < 8.0 won't include the UID yet
-	if datasourceUID == "" {
-		datasourceUID = fmt.Sprintf("%d", settings.ID)
-	}
-
-	var dbInfo map[string]interface{}
-	err := json.Unmarshal(settings.JSONData, &dbInfo)
-	if err != nil {
-		return defaultKey(datasourceUID)
-	}
-	username, ok := dbInfo["username"].(string)
-	if !ok {
-		return defaultKey(datasourceUID)
-	}
-	return defaultKey(fmt.Sprintf("%s-%s", datasourceUID, username))
+	// ConnectionCacheFactory (optional). When non-nil, the Connector invokes
+	// this factory once during construction and uses the returned
+	// ConnectionCache for all per-ConnectionArgs *sql.DB storage. A nil
+	// factory resolves to NewSyncMapCache(), preserving the pre-extension
+	// behaviour byte-for-byte. Plugins use a factory to install a TTL or
+	// LRU cache; per-cache configuration is captured by closure.
+	ConnectionCacheFactory func() ConnectionCache
 }
 
 // NewDatasource creates a new `SQLDatasource`.
 // It uses the provided settings argument to call the ds.Driver to connect to the SQL server
-func (ds *SQLDatasource) NewDatasource(
-	ctx context.Context,
-	settings backend.DataSourceInstanceSettings,
-) (instancemgmt.Instance, error) {
-	db, err := ds.c.Connect(ctx, settings, nil)
-	if err != nil {
-		return nil, DownstreamError(err)
+func (ds *SQLDatasource) NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
+	var opts []ConnectorOption
+	if ds.ConnectionCacheFactory != nil {
+		opts = append(opts, WithCache(ds.ConnectionCacheFactory()))
 	}
-	key := ds.getStoreKey(settings)
-	ds.storeDBConnection(key, dbConnection{db, settings})
+	conn, err := NewConnector(ctx, ds.driver(), settings, ds.EnableMultipleConnections, opts...)
+	if err != nil {
+		return nil, backend.DownstreamError(err)
+	}
 
+	ds.connector = conn
 	mux := http.NewServeMux()
 	err = ds.registerRoutes(mux)
 	if err != nil {
-		return nil, PluginError(err)
+		return nil, backend.PluginError(err)
 	}
 
 	ds.CallResourceHandler = httpadapter.New(mux)
-	ds.driverSettings = ds.c.Settings(ctx, settings)
+	if ds.ResourceMiddleware != nil {
+		ds.CallResourceHandler = ds.ResourceMiddleware(ds.CallResourceHandler)
+	}
+
+	ds.metrics = NewMetrics(settings.Name, settings.Type, EndpointQuery)
+
+	ds.rowLimit = ds.newRowLimit(ctx, conn)
+	ds.rowCapacityHint = conn.driverSettings.RowCapacityHint
 
 	return ds, nil
 }
 
 // NewDatasource initializes the Datasource wrapper and instance manager
 func NewDatasource(c Driver) *SQLDatasource {
-	return &SQLDatasource{
-		c: c,
+	ds := &SQLDatasource{
+		connector:        &Connector{driver: c, cache: NewSyncMapCache()},
+		cachedConverters: c.Converters(),
 	}
+	ds.queryDataMutator, _ = c.(QueryDataMutator)
+	ds.queryMutator, _ = c.(QueryMutator)
+	ds.responseMutator, _ = c.(ResponseMutator)
+	ds.queryArgSetter, _ = c.(QueryArgSetter)
+	ds.queryErrorMutator, _ = c.(QueryErrorMutator)
+	ds.checkHealthMutator, _ = c.(CheckHealthMutator)
+	ds.Interpolator = defaultInterpolator(ds)
+	return ds
 }
 
 // Dispose cleans up datasource instance resources.
 // Note: Called when testing and saving a datasource
 func (ds *SQLDatasource) Dispose() {
+	ds.connector.Dispose()
 }
 
 // QueryData creates the Responses list and executes each query
-func (ds *SQLDatasource) QueryData(
-	ctx context.Context,
-	req *backend.QueryDataRequest,
-) (*backend.QueryDataResponse, error) {
+func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	headers := req.GetHTTPHeaders()
 
 	var (
@@ -144,21 +190,45 @@ func (ds *SQLDatasource) QueryData(
 
 	wg.Add(len(req.Queries))
 
+	if ds.queryDataMutator != nil {
+		ctx, req = ds.queryDataMutator.MutateQueryData(ctx, req)
+	}
+
 	// Execute each query and store the results by query RefID
 	for _, q := range req.Queries {
 		go func(query backend.DataQuery) {
-			frames, err := ds.handleQuery(
-				ctx,
-				query,
-				*req.PluginContext.DataSourceInstanceSettings,
-				headers,
-			)
-			if err == nil {
-				if responseMutator, ok := ds.c.(ResponseMutator); ok {
-					frames, err = responseMutator.MutateResponse(ctx, frames)
-					if err != nil {
-						err = PluginError(err)
-					}
+			defer wg.Done()
+
+			// Panic recovery
+			defer func() {
+				if r := recover(); r != nil {
+					stack := string(debug.Stack())
+					errorMsg := fmt.Sprintf("SQL datasource query execution panic: %v", r)
+
+					// Log panic without sensitive query data
+					backend.Logger.Error(errorMsg,
+						"panic", r,
+						"refID", query.RefID,
+						"queryType", query.QueryType,
+						"maxDataPoints", query.MaxDataPoints,
+						"interval", query.Interval)
+
+					// Log stack trace separately at debug level to avoid exposing in production
+					backend.Logger.Debug("Panic stack trace", "stack", stack)
+
+					response.Set(query.RefID, backend.DataResponse{
+						Frames:      nil,
+						Error:       backend.PluginError(errors.New(errorMsg)),
+						ErrorSource: backend.ErrorSourcePlugin,
+					})
+				}
+			}()
+
+			frames, err := ds.handleQuery(ctx, query, headers)
+			if err == nil && ds.responseMutator != nil {
+				frames, err = ds.responseMutator.MutateResponse(ctx, frames)
+				if err != nil {
+					err = backend.PluginError(err)
 				}
 			}
 
@@ -167,119 +237,83 @@ func (ds *SQLDatasource) QueryData(
 				Error:       err,
 				ErrorSource: ErrorSource(err),
 			})
-
-			wg.Done()
 		}(q)
 	}
 
 	wg.Wait()
 
 	errs := ds.errors(response)
-	if ds.driverSettings.Errors {
+	if ds.DriverSettings().Errors {
 		return response.Response(), errs
 	}
 
 	return response.Response(), nil
 }
 
-func (ds *SQLDatasource) GetDBFromQuery(
-	ctx context.Context,
-	q *Query,
-	settings backend.DataSourceInstanceSettings,
-	datasourceUID string,
-) (*sql.DB, error) {
-	_, dbConn, err := ds.getDBConnectionFromQuery(ctx, q, settings)
+func (ds *SQLDatasource) GetDBFromQuery(ctx context.Context, q *Query) (*sql.DB, error) {
+	_, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
 	return dbConn.db, err
 }
 
-func (ds *SQLDatasource) getDBConnectionFromQuery(
-	ctx context.Context,
-	q *Query,
-	settings backend.DataSourceInstanceSettings,
-) (string, dbConnection, error) {
-	if !ds.EnableMultipleConnections && !ds.driverSettings.ForwardHeaders &&
-		len(q.ConnectionArgs) > 0 {
-		return "", dbConnection{}, MissingMultipleConnectionsConfig
-	}
-	// The database connection may vary depending on query arguments
-	// The raw arguments are used as key to store the db connection in memory so they can be reused
-
-	shouldMultiConnect := ds.EnableMultipleConnections && len(q.ConnectionArgs) > 0
-	key := ds.getStoreKey(settings)
-
-	if shouldMultiConnect {
-		key = keyWithConnectionArgs(key, q.ConnectionArgs)
-	}
-
-	var shouldStore bool
-	dbConn, ok := ds.getDBConnection(key)
-	if !ok {
-		db, err := ds.c.Connect(ctx, settings, q.ConnectionArgs)
-		if err != nil {
-			return "", dbConnection{}, DownstreamError(err)
-		}
-		dbConn = dbConnection{db, settings}
-		shouldStore = true
-	}
-
-	if shouldStore {
-		ds.storeDBConnection(key, dbConn)
-	}
-	return key, dbConn, nil
-}
-
 // handleQuery will call query, and attempt to reconnect if the query failed
-func (ds *SQLDatasource) handleQuery(
-	ctx context.Context,
-	req backend.DataQuery,
-	settings backend.DataSourceInstanceSettings,
-	headers http.Header,
-) (data.Frames, error) {
-	if queryMutator, ok := ds.c.(QueryMutator); ok {
-		ctx, req = queryMutator.MutateQuery(ctx, req)
+func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery, headers http.Header) (data.Frames, error) {
+	settings := ds.DriverSettings()
+
+	if ds.queryMutator != nil {
+		ctx, req = ds.queryMutator.MutateQuery(ctx, req)
 	}
 
 	// Convert the backend.DataQuery into a Query object
-	q, err := GetQuery(req, headers, ds.driverSettings.ForwardHeaders)
+	q, err := GetQuery(req, headers, settings.ForwardHeaders)
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply supported macros to the query
-	q.RawSQL, err = Interpolate(ds.c, q)
+	// Apply supported macros to the query. Uses ds.Interpolator if set,
+	// otherwise the package default — which preserves byte-for-byte parity
+	// with the legacy sqlutil.Interpolate path.
+	q.RawSQL, err = ds.interpolate(ctx, q, req.JSON)
 	if err != nil {
+		if errors.Is(err, sqlutil.ErrorBadArgumentCount) || errors.Is(err, ErrorParsingMacroBrackets) || err.Error() == ErrorParsingMacroBrackets.Error() {
+			err = backend.DownstreamError(err)
+		}
 		return sqlutil.ErrorFrameFromQuery(q), fmt.Errorf("%s: %w", "Could not apply macros", err)
 	}
 
 	// Apply the default FillMode, overwritting it if the query specifies it
-	fillMode := ds.driverSettings.FillMode
+	fillMode := settings.FillMode
 	if q.FillMissing != nil {
 		fillMode = q.FillMissing
 	}
 
 	// Retrieve the database connection
-	cacheKey, dbConn, err := ds.getDBConnectionFromQuery(ctx, q, settings)
+	cacheKey, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
 	if err != nil {
 		return sqlutil.ErrorFrameFromQuery(q), err
 	}
 
-	if ds.driverSettings.Timeout != 0 {
-		tctx, cancel := context.WithTimeout(ctx, ds.driverSettings.Timeout)
+	if settings.Timeout != 0 {
+		tctx, cancel := context.WithTimeout(ctx, settings.Timeout)
 		defer cancel()
 
 		ctx = tctx
 	}
 
 	var args []interface{}
-	if argSetter, ok := ds.c.(QueryArgSetter); ok {
-		args = argSetter.SetQueryArgs(ctx, headers)
+	if ds.queryArgSetter != nil {
+		args = ds.queryArgSetter.SetQueryArgs(ctx, headers)
 	}
+
+	queryErrorMutator := ds.queryErrorMutator
 
 	// FIXES:
 	//  * Some datasources (snowflake) expire connections or have an authentication token that expires if not used in 1 or 4 hours.
 	//    Because the datasource driver does not include an option for permanent connections, we retry the connection
 	//    if the query fails. NOTE: this does not include some errors like "ErrNoRows"
-	res, err := QueryDB(ctx, dbConn.db, ds.c.Converters(), fillMode, q, args...)
+	dbQuery := NewQuery(dbConn.db, dbConn.settings, ds.cachedConverters, fillMode, ds.rowLimit).
+		WithRowCapacityHint(ds.rowCapacityHint).
+		WithResponseThresholds(ds.DriverSettings().ResponseThresholds)
+	res, err := dbQuery.Run(ctx, q, queryErrorMutator, args...)
 	if err == nil {
 		return res, nil
 	}
@@ -292,24 +326,26 @@ func (ds *SQLDatasource) handleQuery(
 	// context deadline retry the query
 	if errors.Is(err, ErrorQuery) && !errors.Is(err, context.DeadlineExceeded) {
 		// only retry on messages that contain specific errors
-		if shouldRetry(ds.driverSettings.RetryOn, err.Error()) {
-			for i := 0; i < ds.driverSettings.Retries; i++ {
-				backend.Logger.Warn(
-					fmt.Sprintf("query failed: %s. Retrying %d times", err.Error(), i),
-				)
-				db, err := ds.dbReconnect(ctx, dbConn, q, cacheKey)
+		if shouldRetry(settings.RetryOn, err.Error()) {
+			for i := 0; i < settings.Retries; i++ {
+				backend.Logger.Warn(fmt.Sprintf("query failed: %s. Retrying %d times", err.Error(), i))
+				db, err := ds.connector.Reconnect(ctx, dbConn, q, cacheKey)
 				if err != nil {
-					return nil, DownstreamError(err)
+					return nil, backend.DownstreamError(err)
 				}
 
-				if ds.driverSettings.Pause > 0 {
-					time.Sleep(time.Duration(ds.driverSettings.Pause * int(time.Second)))
+				if settings.Pause > 0 {
+					time.Sleep(time.Duration(settings.Pause * int(time.Second)))
 				}
-				res, err = QueryDB(ctx, db, ds.c.Converters(), fillMode, q, args...)
+
+				dbQuery := NewQuery(db, dbConn.settings, ds.cachedConverters, fillMode, ds.rowLimit).
+					WithRowCapacityHint(ds.rowCapacityHint).
+					WithResponseThresholds(ds.DriverSettings().ResponseThresholds)
+				res, err = dbQuery.Run(ctx, q, queryErrorMutator, args...)
 				if err == nil {
 					return res, err
 				}
-				if !shouldRetry(ds.driverSettings.RetryOn, err.Error()) {
+				if !shouldRetry(settings.RetryOn, err.Error()) {
 					return res, err
 				}
 				backend.Logger.Warn(fmt.Sprintf("Retry failed: %s", err.Error()))
@@ -317,138 +353,55 @@ func (ds *SQLDatasource) handleQuery(
 		}
 	}
 
+	// Check if the error is retryable and convert to downstream error if so
+	if errors.Is(err, ErrorQuery) && shouldRetry(settings.RetryOn, err.Error()) {
+		// Convert retryable errors to downstream errors
+		if !backend.IsDownstreamError(err) {
+			err = backend.DownstreamError(err)
+		}
+	}
+
 	// allow retries on timeouts
 	if errors.Is(err, context.DeadlineExceeded) {
-		for i := 0; i < ds.driverSettings.Retries; i++ {
+		for i := 0; i < settings.Retries; i++ {
 			backend.Logger.Warn(fmt.Sprintf("connection timed out. retrying %d times", i))
-			db, err := ds.dbReconnect(ctx, dbConn, q, cacheKey)
+			db, err := ds.connector.Reconnect(ctx, dbConn, q, cacheKey)
 			if err != nil {
 				continue
 			}
 
-			res, err = QueryDB(ctx, db, ds.c.Converters(), fillMode, q, args...)
+			dbQuery := NewQuery(db, dbConn.settings, ds.cachedConverters, fillMode, ds.rowLimit).
+				WithRowCapacityHint(ds.rowCapacityHint)
+			res, err = dbQuery.Run(ctx, q, queryErrorMutator, args...)
 			if err == nil {
 				return res, err
 			}
 		}
 	}
 
-	return nil, err
-}
-
-func (ds *SQLDatasource) dbReconnect(
-	ctx context.Context,
-	dbConn dbConnection,
-	q *Query,
-	cacheKey string,
-) (*sql.DB, error) {
-	if err := dbConn.db.Close(); err != nil {
-		backend.Logger.Warn(fmt.Sprintf("closing existing connection failed: %s", err.Error()))
-	}
-
-	db, err := ds.c.Connect(ctx, dbConn.settings, q.ConnectionArgs)
-	if err != nil {
-		return nil, DownstreamError(err)
-	}
-	ds.storeDBConnection(cacheKey, dbConnection{db, dbConn.settings})
-	return db, nil
+	return res, err
 }
 
 // CheckHealth pings the connected SQL database
-func (ds *SQLDatasource) CheckHealth(
-	ctx context.Context,
-	req *backend.CheckHealthRequest,
-) (*backend.CheckHealthResult, error) {
-	key := ds.getStoreKey(*req.PluginContext.DataSourceInstanceSettings)
-	dbConn, ok := ds.getDBConnection(key)
-	if !ok {
-		return nil, ErrorMissingDBConnection
+func (ds *SQLDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
+	if ds.checkHealthMutator != nil {
+		ctx, req = ds.checkHealthMutator.MutateCheckHealth(ctx, req)
 	}
-
-	if ds.driverSettings.Retries == 0 {
-		return ds.check(dbConn)
+	healthChecker := &HealthChecker{
+		Connector:       ds.connector,
+		Metrics:         ds.metrics.WithEndpoint(EndpointHealth),
+		PreCheckHealth:  ds.PreCheckHealth,
+		PostCheckHealth: ds.PostCheckHealth,
 	}
-
-	return ds.checkWithRetries(ctx, dbConn, key, req.GetHTTPHeaders())
+	return healthChecker.Check(ctx, req)
 }
 
 func (ds *SQLDatasource) DriverSettings() DriverSettings {
-	return ds.driverSettings
+	return ds.connector.driverSettings
 }
 
-func (ds *SQLDatasource) checkWithRetries(
-	ctx context.Context,
-	conn dbConnection,
-	key string,
-	headers http.Header,
-) (*backend.CheckHealthResult, error) {
-	var result *backend.CheckHealthResult
-
-	q := &Query{}
-	if ds.driverSettings.ForwardHeaders {
-		applyHeaders(q, headers)
-	}
-
-	for i := 0; i < ds.driverSettings.Retries; i++ {
-		db, err := ds.dbReconnect(ctx, conn, q, key)
-		if err != nil {
-			return nil, err
-		}
-		c := dbConnection{
-			db:       db,
-			settings: conn.settings,
-		}
-		result, err = ds.check(c)
-		if err == nil {
-			return result, err
-		}
-
-		if !shouldRetry(ds.driverSettings.RetryOn, err.Error()) {
-			break
-		}
-
-		if ds.driverSettings.Pause > 0 {
-			time.Sleep(time.Duration(ds.driverSettings.Pause * int(time.Second)))
-		}
-		backend.Logger.Warn(fmt.Sprintf("connect failed: %s. Retrying %d times", err.Error(), i))
-	}
-
-	// TODO: failed health checks don't return an error
-	return result, nil
-}
-
-func (ds *SQLDatasource) check(conn dbConnection) (*backend.CheckHealthResult, error) {
-	if err := ds.ping(conn); err != nil {
-		return &backend.CheckHealthResult{
-			Status:  backend.HealthStatusError,
-			Message: err.Error(),
-		}, DownstreamError(err)
-	}
-
-	return &backend.CheckHealthResult{
-		Status:  backend.HealthStatusOk,
-		Message: "Data source is working",
-	}, nil
-}
-
-func (ds *SQLDatasource) ping(conn dbConnection) error {
-	if ds.driverSettings.Timeout == 0 {
-		return conn.db.Ping()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), ds.driverSettings.Timeout)
-	defer cancel()
-
-	return conn.db.PingContext(ctx)
-}
-
-func shouldRetry(retryOn []string, err string) bool {
-	for _, r := range retryOn {
-		if strings.Contains(err, r) {
-			return true
-		}
-	}
-	return false
+func (ds *SQLDatasource) driver() Driver {
+	return ds.connector.driver
 }
 
 func (ds *SQLDatasource) errors(response *Response) error {
@@ -467,4 +420,59 @@ func (ds *SQLDatasource) errors(response *Response) error {
 		backend.Logger.Error(err.Error())
 	}
 	return err
+}
+
+func (ds *SQLDatasource) GetRowLimit() int64 {
+	return ds.rowLimit
+}
+
+func (ds *SQLDatasource) SetDefaultRowLimit(limit int64) {
+	ds.EnableRowLimit = true
+	ds.rowLimit = limit
+}
+
+// newRowLimit returns the row limit for the datasource
+// It checks in the following order:
+// 1. set in the datasource configuration page
+// 2. set via the environment variable
+// 3. set is set on grafana_ini and passed via grafana context
+// 4. default row limit set by SetDefaultRowLimit
+func (ds *SQLDatasource) newRowLimit(ctx context.Context, conn *Connector) int64 {
+	if !ds.EnableRowLimit {
+		return defaultRowLimit
+	}
+
+	// Handles when row limit is set in the datasource configuration page
+	settingsLimit := conn.driverSettings.RowLimit
+	if settingsLimit != 0 {
+		return settingsLimit
+	}
+
+	// Handles when row limit is set via environment variable
+	envLimit := os.Getenv(envRowLimit)
+	if envLimit != "" {
+		l, err := strconv.ParseInt(envLimit, 10, 64)
+		if err == nil && l >= 0 {
+			return l
+		}
+		log.DefaultLogger.Error(fmt.Sprintf("failed setting row limit from environment variable: %s", err))
+	}
+
+	// Handles row limit from sql config from grafana instance
+	config := backend.GrafanaConfigFromContext(ctx)
+	if ds.EnableRowLimit && config != nil {
+		sqlConfig, err := config.SQL()
+		if err != nil {
+			backend.Logger.Error(fmt.Sprintf("failed setting row limit from sql config: %s", err))
+		} else {
+			return sqlConfig.RowLimit
+		}
+	}
+
+	// handles SetDefaultRowLimit where it is set before the datasource is initialized
+	if ds.rowLimit != 0 {
+		return ds.rowLimit
+	}
+
+	return defaultRowLimit
 }
