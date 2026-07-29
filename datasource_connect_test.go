@@ -119,7 +119,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 				conn.storeDBConnection(key, CachedConnection{tt.existingDB, settings})
 			}
 
-			key, dbConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage(tt.args)})
+			key, dbConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage(tt.args)}, &settings)
 			if err != nil {
 				t.Fatalf("unexpected error %v", err)
 			}
@@ -134,7 +134,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 
 	t.Run("it should return an error if connection args are used without enabling multiple connections", func(t *testing.T) {
 		conn := &Connector{driver: d, enableMultipleConnections: false, cache: NewSyncMapCache()}
-		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")})
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")}, nil)
 		if err == nil || !errors.Is(err, MissingMultipleConnectionsConfig) {
 			t.Errorf("expecting error: %v", MissingMultipleConnectionsConfig)
 		}
@@ -142,11 +142,64 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 
 	t.Run("it should return an error if the default connection is missing", func(t *testing.T) {
 		conn := &Connector{driver: d, cache: NewSyncMapCache()}
-		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{})
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, nil)
 		if err == nil || !errors.Is(err, MissingDBConnection) {
 			t.Errorf("expecting error: %v", MissingDBConnection)
 		}
 	})
+}
+
+// Test_GetConnectionFromQuery_perUser guards the vunet per-user connection feature
+// end-to-end through the query path: two users sharing one datasource UID but with
+// different JSONData usernames MUST get isolated connections, keyed per-request from
+// the CURRENT request settings. This is the regression the v5 port introduced —
+// keying only once in NewConnector made every user reuse the instance-init
+// connection. Test_storeKeyFor passed while this real path was broken, so the guard
+// has to live here, on GetConnectionFromQuery.
+func Test_GetConnectionFromQuery_perUser(t *testing.T) {
+	dbAlice := &sql.DB{}
+	dbBob := &sql.DB{}
+	d := &fakeDriver{openDBfn: func(msg json.RawMessage) (*sql.DB, error) { return dbBob, nil }}
+
+	// Connector bootstrapped for alice, exactly as NewConnector would for the instance.
+	aliceSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"alice"}`)}
+	conn := &Connector{
+		UID:            "uid1",
+		storeKey:       storeKeyFor(aliceSettings),
+		defaultKey:     defaultKey(storeKeyFor(aliceSettings)),
+		driver:         d,
+		driverSettings: DriverSettings{},
+		cache:          NewSyncMapCache(),
+	}
+	conn.storeDBConnection(conn.defaultKey, CachedConnection{dbAlice, aliceSettings})
+
+	// alice reuses the bootstrap connection under key "uid1-alice-default".
+	aliceKey, aliceConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, &aliceSettings)
+	if err != nil {
+		t.Fatalf("alice: unexpected error %v", err)
+	}
+	if aliceKey != "uid1-alice-default" {
+		t.Fatalf("alice: unexpected key %q", aliceKey)
+	}
+	if aliceConn.db != dbAlice {
+		t.Fatalf("alice: expected the bootstrap connection")
+	}
+
+	// bob MUST get a distinct key and a freshly opened connection — never alice's.
+	bobSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"bob"}`)}
+	bobKey, bobConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, &bobSettings)
+	if err != nil {
+		t.Fatalf("bob: unexpected error %v", err)
+	}
+	if bobKey != "uid1-bob-default" {
+		t.Fatalf("bob: unexpected key %q", bobKey)
+	}
+	if bobKey == aliceKey {
+		t.Fatalf("per-user isolation broken: alice and bob share key %q", bobKey)
+	}
+	if bobConn.db == dbAlice || bobConn.db != dbBob {
+		t.Fatalf("per-user isolation broken: bob did not get his own connection")
+	}
 }
 
 func Test_Dispose(t *testing.T) {

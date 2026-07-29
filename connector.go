@@ -204,23 +204,44 @@ func (c *Connector) Dispose() {
 	c.connCache().Dispose()
 }
 
-func (c *Connector) GetConnectionFromQuery(ctx context.Context, q *Query) (string, CachedConnection, error) {
+func (c *Connector) GetConnectionFromQuery(ctx context.Context, q *Query, settings *backend.DataSourceInstanceSettings) (string, CachedConnection, error) {
 	if !c.enableMultipleConnections && !c.driverSettings.ForwardHeaders && len(q.ConnectionArgs) > 0 && string(q.ConnectionArgs) != "{}" {
 		return "", CachedConnection{}, MissingMultipleConnectionsConfig
 	}
-	// The database connection may vary depending on query arguments
-	// The raw arguments are used as key to store the db connection in memory so they can be reused
-	key := c.defaultKey
+	// Per-request base key. Re-derive it from the CURRENT request's settings so a
+	// per-user credential rewrite (the vunet per-user connection feature) routes to
+	// a connection opened as *that* user, instead of always reusing the connection
+	// created at instance-init. Keying only once in NewConnector made every user
+	// share the instance-init connection — restoring per-request keying here brings
+	// back the pre-v5 (v1.x getStoreKey(settings)) behaviour.
+	//
+	// When settings are absent (GetDBFromQuery / tests), fall back to the
+	// connector's init storeKey and the bootstrap connection.
+	baseKey := c.storeKey
+	if settings != nil {
+		baseKey = storeKeyFor(*settings)
+	}
+	key := defaultKey(baseKey)
 	dbConn, ok := c.getDBConnection(key)
 	if !ok {
-		return "", CachedConnection{}, MissingDBConnection
+		if settings == nil {
+			return "", CachedConnection{}, MissingDBConnection
+		}
+		// No pooled connection for this user yet — open one with the current
+		// settings and cache it under the per-user key.
+		db, err := c.driver.Connect(ctx, *settings, nil)
+		if err != nil {
+			return "", CachedConnection{}, backend.DownstreamError(err)
+		}
+		dbConn = CachedConnection{db, *settings}
+		c.storeDBConnection(key, dbConn)
 	}
 	if !c.enableMultipleConnections || len(q.ConnectionArgs) == 0 {
 		backend.Logger.Debug("using single user connection")
 		return key, dbConn, nil
 	}
 
-	key = keyWithConnectionArgs(c.storeKey, q.ConnectionArgs)
+	key = keyWithConnectionArgs(baseKey, q.ConnectionArgs)
 	if cachedConn, ok := c.getDBConnection(key); ok {
 		backend.Logger.Debug("cached connection")
 		return key, cachedConn, nil

@@ -113,7 +113,7 @@ func BenchmarkConnector_GetConnectionFromQuery_SingleConn(b *testing.B) {
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _, err := ds.connector.GetConnectionFromQuery(ctx, q)
+		_, _, err := ds.connector.GetConnectionFromQuery(ctx, q, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

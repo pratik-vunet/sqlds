@@ -182,6 +182,11 @@ func (ds *SQLDatasource) Dispose() {
 // QueryData creates the Responses list and executes each query
 func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	headers := req.GetHTTPHeaders()
+	// Capture the CURRENT request's instance settings so the connection is keyed
+	// per-user (vunet per-user connection): nairobi rewrites the datasource
+	// username per logged-in user, and handleQuery must route to the matching
+	// pooled connection instead of the instance-init default.
+	dsSettings := req.PluginContext.DataSourceInstanceSettings
 
 	var (
 		response = NewResponse(backend.NewQueryDataResponse())
@@ -224,7 +229,7 @@ func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRe
 				}
 			}()
 
-			frames, err := ds.handleQuery(ctx, query, headers)
+			frames, err := ds.handleQuery(ctx, query, headers, dsSettings)
 			if err == nil && ds.responseMutator != nil {
 				frames, err = ds.responseMutator.MutateResponse(ctx, frames)
 				if err != nil {
@@ -251,12 +256,12 @@ func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRe
 }
 
 func (ds *SQLDatasource) GetDBFromQuery(ctx context.Context, q *Query) (*sql.DB, error) {
-	_, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
+	_, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q, nil)
 	return dbConn.db, err
 }
 
 // handleQuery will call query, and attempt to reconnect if the query failed
-func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery, headers http.Header) (data.Frames, error) {
+func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery, headers http.Header, dsSettings *backend.DataSourceInstanceSettings) (data.Frames, error) {
 	settings := ds.DriverSettings()
 
 	if ds.queryMutator != nil {
@@ -287,7 +292,7 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 	}
 
 	// Retrieve the database connection
-	cacheKey, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
+	cacheKey, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q, dsSettings)
 	if err != nil {
 		return sqlutil.ErrorFrameFromQuery(q), err
 	}
