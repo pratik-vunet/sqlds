@@ -43,6 +43,16 @@ func Test_storeKeyFor(t *testing.T) {
 	}
 }
 
+// ctxWithSettings builds the context the Grafana SDK hands to a plugin handler:
+// one carrying the PluginContext (and therefore the DataSourceInstanceSettings)
+// of the request being served. The per-user connection keying reads the settings
+// from ctx, so tests must supply them the same way the SDK does.
+func ctxWithSettings(settings backend.DataSourceInstanceSettings) context.Context {
+	return backend.WithPluginContext(context.Background(), backend.PluginContext{
+		DataSourceInstanceSettings: &settings,
+	})
+}
+
 type fakeDriver struct {
 	openDBfn func(msg json.RawMessage) (*sql.DB, error)
 
@@ -119,7 +129,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 				conn.storeDBConnection(key, CachedConnection{tt.existingDB, settings})
 			}
 
-			key, dbConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage(tt.args)}, &settings)
+			key, dbConn, err := conn.GetConnectionFromQuery(ctxWithSettings(settings), &Query{ConnectionArgs: json.RawMessage(tt.args)})
 			if err != nil {
 				t.Fatalf("unexpected error %v", err)
 			}
@@ -134,7 +144,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 
 	t.Run("it should return an error if connection args are used without enabling multiple connections", func(t *testing.T) {
 		conn := &Connector{driver: d, enableMultipleConnections: false, cache: NewSyncMapCache()}
-		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")}, nil)
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{ConnectionArgs: json.RawMessage("foo")})
 		if err == nil || !errors.Is(err, MissingMultipleConnectionsConfig) {
 			t.Errorf("expecting error: %v", MissingMultipleConnectionsConfig)
 		}
@@ -142,7 +152,7 @@ func Test_getDBConnectionFromQuery(t *testing.T) {
 
 	t.Run("it should return an error if the default connection is missing", func(t *testing.T) {
 		conn := &Connector{driver: d, cache: NewSyncMapCache()}
-		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, nil)
+		_, _, err := conn.GetConnectionFromQuery(context.Background(), &Query{})
 		if err == nil || !errors.Is(err, MissingDBConnection) {
 			t.Errorf("expecting error: %v", MissingDBConnection)
 		}
@@ -174,7 +184,7 @@ func Test_GetConnectionFromQuery_perUser(t *testing.T) {
 	conn.storeDBConnection(conn.defaultKey, CachedConnection{dbAlice, aliceSettings})
 
 	// alice reuses the bootstrap connection under key "uid1-alice-default".
-	aliceKey, aliceConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, &aliceSettings)
+	aliceKey, aliceConn, err := conn.GetConnectionFromQuery(ctxWithSettings(aliceSettings), &Query{})
 	if err != nil {
 		t.Fatalf("alice: unexpected error %v", err)
 	}
@@ -187,7 +197,7 @@ func Test_GetConnectionFromQuery_perUser(t *testing.T) {
 
 	// bob MUST get a distinct key and a freshly opened connection — never alice's.
 	bobSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"bob"}`)}
-	bobKey, bobConn, err := conn.GetConnectionFromQuery(context.Background(), &Query{}, &bobSettings)
+	bobKey, bobConn, err := conn.GetConnectionFromQuery(ctxWithSettings(bobSettings), &Query{})
 	if err != nil {
 		t.Fatalf("bob: unexpected error %v", err)
 	}
@@ -199,6 +209,83 @@ func Test_GetConnectionFromQuery_perUser(t *testing.T) {
 	}
 	if bobConn.db == dbAlice || bobConn.db != dbBob {
 		t.Fatalf("per-user isolation broken: bob did not get his own connection")
+	}
+}
+
+// Test_Connect_perUser guards the health path. Master keyed CheckHealth by the
+// requesting user (getStoreKey(*req.PluginContext.DataSourceInstanceSettings));
+// the v5 port left Connect on the init-time defaultKey, so "Save & Test" reported
+// on the init user's credentials no matter who clicked it.
+func Test_Connect_perUser(t *testing.T) {
+	aliceSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"alice"}`)}
+	bobSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"bob"}`)}
+
+	var connectedAs []string
+	d := &fakeDriver{openDBfn: func(_ json.RawMessage) (*sql.DB, error) { return &sql.DB{}, nil }}
+
+	conn := &Connector{
+		UID:            "uid1",
+		storeKey:       storeKeyFor(aliceSettings),
+		defaultKey:     defaultKey(storeKeyFor(aliceSettings)),
+		driver:         d,
+		driverSettings: DriverSettings{},
+		cache:          NewSyncMapCache(),
+	}
+	conn.storeDBConnection(conn.defaultKey, CachedConnection{&sql.DB{}, aliceSettings})
+
+	// Connect pings, which a zero-value *sql.DB cannot do; we only care which
+	// cache key each caller resolves to, so inspect the cache afterwards.
+	_, _, _ = conn.defaultConnection(ctxWithSettings(aliceSettings), conn.baseKey(ctxWithSettings(aliceSettings)))
+	_, _, _ = conn.defaultConnection(ctxWithSettings(bobSettings), conn.baseKey(ctxWithSettings(bobSettings)))
+
+	conn.cache.Range(func(key string, _ CachedConnection) bool {
+		connectedAs = append(connectedAs, key)
+		return true
+	})
+
+	for _, want := range []string{"uid1-alice-default", "uid1-bob-default"} {
+		found := false
+		for _, got := range connectedAs {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("health path did not resolve a connection for %q; cache holds %v", want, connectedAs)
+		}
+	}
+}
+
+// Test_GetDBFromQuery_perUser guards the resource-handler path (autocomplete,
+// custom routes). It used to pass nil settings, which routed every caller to the
+// init user's connection.
+func Test_GetDBFromQuery_perUser(t *testing.T) {
+	dbAlice := &sql.DB{}
+	dbBob := &sql.DB{}
+	d := &fakeDriver{openDBfn: func(_ json.RawMessage) (*sql.DB, error) { return dbBob, nil }}
+
+	aliceSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"alice"}`)}
+	bobSettings := backend.DataSourceInstanceSettings{UID: "uid1", JSONData: []byte(`{"username":"bob"}`)}
+
+	ds := &SQLDatasource{connector: &Connector{
+		UID:            "uid1",
+		storeKey:       storeKeyFor(aliceSettings),
+		defaultKey:     defaultKey(storeKeyFor(aliceSettings)),
+		driver:         d,
+		driverSettings: DriverSettings{},
+		cache:          NewSyncMapCache(),
+	}}
+	ds.connector.storeDBConnection(ds.connector.defaultKey, CachedConnection{dbAlice, aliceSettings})
+
+	got, err := ds.GetDBFromQuery(ctxWithSettings(bobSettings), &Query{})
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if got == dbAlice {
+		t.Fatal("GetDBFromQuery handed bob alice's connection")
+	}
+	if got != dbBob {
+		t.Fatal("GetDBFromQuery did not open a connection for bob")
 	}
 }
 

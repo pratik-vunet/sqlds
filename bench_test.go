@@ -32,6 +32,9 @@ func newBenchDS(driver Driver) *SQLDatasource {
 	ds := NewDatasource(driver)
 	ds.connector.UID = "bench-uid"
 	ds.connector.driverSettings = DriverSettings{}
+	// storeKey is the base the per-request key derivation falls back to when ctx
+	// carries no PluginContext, which is the case for these benchmarks.
+	ds.connector.storeKey = ds.connector.UID
 	ds.connector.defaultKey = defaultKey(ds.connector.UID)
 	ds.connector.storeDBConnection(ds.connector.defaultKey, CachedConnection{
 		db:       nil,
@@ -113,7 +116,7 @@ func BenchmarkConnector_GetConnectionFromQuery_SingleConn(b *testing.B) {
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _, err := ds.connector.GetConnectionFromQuery(ctx, q, nil)
+		_, _, err := ds.connector.GetConnectionFromQuery(ctx, q)
 		if err != nil {
 			b.Fatal(err)
 		}
